@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 오래된 순 정주행
 // @namespace    youtube-oldest-first-binge
-// @version      1.7.0
+// @version      1.8.0
 // @description  채널 동영상을 가장 오래된 영상부터, 재생목록은 정해진 순서(또는 거꾸로)로 이어서 재생합니다.
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -260,12 +260,129 @@
     };
   }
 
+  // 저장 위치
+  // - localStorage(KEY): 모든 탭이 같이 쓰는 작은 기록. 채널·재생목록별 진행 기록, 저장한 재생목록,
+  //   마지막 정주행(lastKey), 정주행 목록 색인(queues: { key: { usedAt, size, sig } })
+  // - localStorage(QKEY + key): 정주행 목록 하나(영상 ID와 제목). 필요한 것만 읽는다.
+  // - sessionStorage(TAB_KEY): 이 탭에서 보고 있는 정주행 { key, active, index }
+  //   탭마다 따로라서 여러 탭에서 서로 다른 정주행을 동시에 할 수 있다.
   const KEY = 'oldestFirstBinge.v1';
-  function load() {
-    try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; }
+  const QKEY = 'oldestFirstBinge.q:';
+  const TAB_KEY = 'oldestFirstBinge.tab';
+  const QUEUE_FIELDS = ['ids', 'meta', 'channelName', 'base', 'channelId', 'listId', 'reverse'];
+  const MAX_QUEUES = 12;
+  const MAX_CHARS = 2000000;
+
+  function readJSON(store, k) {
+    try { return JSON.parse(store.getItem(k)) || {}; } catch (e) { return {}; }
   }
+  function writeJSON(store, k, v) {
+    try { store.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; }
+  }
+  function removeKey(k) {
+    try { localStorage.removeItem(k); } catch (e) { /* 무시 */ }
+  }
+
+  function readShared() {
+    const sh = readJSON(localStorage, KEY);
+    if (!sh.ids || !sh.key) return sh;
+    // 1.7.0 이하 형식(정주행 하나를 통째로 저장)을 옮긴다.
+    const q = {};
+    QUEUE_FIELDS.forEach((f) => { q[f] = sh[f]; });
+    writeJSON(localStorage, QKEY + sh.key, q);
+    if (sh.active && !readJSON(sessionStorage, TAB_KEY).key) {
+      writeJSON(sessionStorage, TAB_KEY, { key: sh.key, active: true, index: sh.index || 0 });
+    }
+    const out = {
+      progress: sh.progress || {},
+      saved: sh.saved || {},
+      dismissed: !!sh.dismissed,
+      listOpen: !!sh.listOpen,
+      lastKey: sh.key,
+      queues: { [sh.key]: { usedAt: Date.now(), size: JSON.stringify(q).length, sig: '' } },
+    };
+    writeJSON(localStorage, KEY, out);
+    return out;
+  }
+
+  // 이 탭의 정주행(없으면 마지막 정주행)을 한 객체로 합쳐 돌려준다.
+  function load() {
+    const sh = readShared();
+    const tab = readJSON(sessionStorage, TAB_KEY);
+    const key = tab.key || sh.lastKey || null;
+    const q = key ? readJSON(localStorage, QKEY + key) : {};
+    const prog = sh.progress && sh.progress[key];
+    const s = {};
+    QUEUE_FIELDS.forEach((f) => { if (q[f] !== undefined) s[f] = q[f]; });
+    return Object.assign(s, {
+      key,
+      ownTab: !!tab.key,
+      active: !!(tab.key && tab.active && q.ids),
+      index: tab.key && typeof tab.index === 'number' ? tab.index : (prog ? prog.index : 0),
+      progress: sh.progress || {},
+      saved: sh.saved || {},
+      dismissed: !!sh.dismissed,
+      listOpen: !!sh.listOpen,
+    });
+  }
+
+  // 오래 안 쓴 정주행 목록부터 지운다. 진행 기록(progress)은 남는다.
+  function trimQueues(sh, keep, all) {
+    const keys = Object.keys(sh.queues).sort((a, b) => (sh.queues[b].usedAt || 0) - (sh.queues[a].usedAt || 0));
+    let total = 0;
+    keys.forEach((k, i) => {
+      if (k === keep) return;
+      const size = sh.queues[k].size || 0;
+      if (all || i >= MAX_QUEUES || total + size > MAX_CHARS) {
+        delete sh.queues[k];
+        removeKey(QKEY + k);
+      } else {
+        total += size;
+      }
+    });
+  }
+
+  function queueSig(s) {
+    const ids = s.ids || [];
+    return [ids.length, ids[0], ids[ids.length - 1], !!s.meta, s.channelName, s.listId, !!s.reverse].join('|');
+  }
+
+  // 다른 탭이 그사이 바꾼 내용을 지우지 않도록, 공용 기록은 다시 읽어서 이 탭 몫만 합친다.
   function save(s) {
-    try { localStorage.setItem(KEY, JSON.stringify(s)); } catch (e) { /* 저장 공간 없음 */ }
+    const sh = readShared();
+    sh.progress = sh.progress || {};
+    sh.saved = Object.assign(sh.saved || {}, s.saved);
+    sh.queues = sh.queues || {};
+    if (s.key) {
+      if (s.progress && s.progress[s.key]) sh.progress[s.key] = s.progress[s.key];
+      if (s.ids) {
+        const entry = sh.queues[s.key] || {};
+        const sig = queueSig(s);
+        entry.usedAt = Date.now();
+        if (entry.sig !== sig) {
+          const q = {};
+          QUEUE_FIELDS.forEach((f) => { q[f] = s[f]; });
+          entry.size = JSON.stringify(q).length;
+          let ok = writeJSON(localStorage, QKEY + s.key, q);
+          if (!ok) {
+            // 저장 공간이 모자라면 다른 정주행 목록을 지우고, 그래도 안 되면 제목 없이 저장(목록을 열 때 다시 받음)
+            trimQueues(sh, s.key, true);
+            ok = writeJSON(localStorage, QKEY + s.key, q);
+            if (!ok) { delete q.meta; ok = writeJSON(localStorage, QKEY + s.key, q); }
+          }
+          entry.sig = ok && q.meta === s.meta ? sig : ''; // 제목을 빼고 저장했으면 다음에 다시 시도
+        }
+        sh.queues[s.key] = entry;
+      }
+    }
+    sh.dismissed = !!s.dismissed;
+    sh.listOpen = !!s.listOpen;
+    if (s.active) sh.lastKey = s.key;
+    trimQueues(sh, s.key, false);
+    writeJSON(localStorage, KEY, sh);
+    if (s.ownTab || s.active) {
+      writeJSON(sessionStorage, TAB_KEY, { key: s.key, active: !!s.active, index: s.index || 0 });
+    }
   }
 
   function channelBase(pathname) {
