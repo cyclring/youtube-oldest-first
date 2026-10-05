@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 오래된 순 정주행
 // @namespace    youtube-oldest-first-binge
-// @version      1.4.0
+// @version      1.5.0
 // @description  채널 동영상을 가장 오래된 영상부터, 재생목록은 정해진 순서(또는 거꾸로)로 이어서 재생합니다.
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -65,6 +65,7 @@
   // 재생목록 응답 한 페이지에서 영상 정보와 다음 페이지 토큰을 꺼낸다.
   function parsePage(json) {
     const videos = [];
+    const playlists = [];
     let token = null;
     (function walk(o) {
       if (Array.isArray(o)) { o.forEach(walk); return; }
@@ -72,6 +73,11 @@
       const lv = o.lockupViewModel;
       if (lv && lv.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO' && lv.contentId) {
         videos.push(lockupInfo(lv));
+        return;
+      }
+      if (lv && lv.contentType === 'LOCKUP_CONTENT_TYPE_PLAYLIST' && lv.contentId) {
+        const md = (lv.metadata && lv.metadata.lockupMetadataViewModel) || {};
+        playlists.push({ id: lv.contentId, title: (md.title && md.title.content) || '', count: findBadge(lv.contentImage) });
         return;
       }
       const pv = o.playlistVideoRenderer; // 예전 형식
@@ -86,7 +92,8 @@
       }
       for (const k in o) walk(o[k]);
     })([json && json.contents, json && json.onResponseReceivedActions]);
-    return { videos, token };
+    const meta = json && json.metadata && json.metadata.playlistMetadataRenderer;
+    return { videos, playlists, token, title: (meta && meta.title) || '' };
   }
 
   // 업로드 재생목록 전체를 받아 최신순 배열로 돌려준다.
@@ -95,6 +102,7 @@
     const seen = new Set();
     const usedTokens = new Set();
     let res = await post('browse', { browseId: 'VL' + playlistId });
+    items.title = parsePage(res).title;
     for (let page = 0; page < 300; page++) {
       const { videos, token } = parsePage(res);
       for (const v of videos) {
@@ -123,6 +131,26 @@
     const id = r && r.endpoint && r.endpoint.browseEndpoint && r.endpoint.browseEndpoint.browseId;
     if (/^UC[\w-]{22}$/.test(id || '')) return id;
     throw new Error('채널 ID를 찾지 못했습니다');
+  }
+
+  const PLAYLISTS_TAB = 'EglwbGF5bGlzdHPyBgQKAkIA';
+
+  // 채널이 만든 재생목록 목록(재생목록 탭)
+  async function fetchChannelPlaylists(post, channelId) {
+    const out = [];
+    const seen = new Set();
+    const usedTokens = new Set();
+    let res = await post('browse', { browseId: channelId, params: PLAYLISTS_TAB });
+    for (let page = 0; page < 100; page++) {
+      const { playlists, token } = parsePage(res);
+      for (const p of playlists) {
+        if (!seen.has(p.id)) { seen.add(p.id); out.push(p); }
+      }
+      if (!token || usedTokens.has(token)) break;
+      usedTokens.add(token);
+      res = await post('browse', { continuation: token });
+    }
+    return out;
   }
 
   // 정주행 대상: 채널({ channelId | base }) 또는 재생목록({ listId, reverse })
@@ -168,7 +196,7 @@
     return { playlistId, added, skipped };
   }
 
-  const Core = { parsePage, fetchPlaylist, fetchOldestFirst, resolveChannelId, fetchSource, savePlaylist };
+  const Core = { parsePage, fetchPlaylist, fetchOldestFirst, resolveChannelId, fetchSource, savePlaylist, fetchChannelPlaylists };
   if (typeof module === 'object' && module.exports) { module.exports = Core; return; }
 
   // ───────── 여기부터 YouTube 페이지 동작 ─────────
@@ -363,6 +391,7 @@
     head: 'display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;padding:2px 8px 6px;color:#aaa;font-size:12px',
     small: SUB + 'padding:4px 8px;font-size:12px;background:rgba(255,255,255,.14);color:#fff',
     link: 'color:#3ea6ff;text-decoration:none;font-size:12px',
+    pickRow: 'display:flex;gap:6px;align-items:center;padding:6px 8px;border-radius:8px',
     item: ITEM,
     itemCur: ITEM + 'background:rgba(62,166,255,.24)',
     num: 'flex:0 0 32px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums',
@@ -428,7 +457,7 @@
     if (!box) return;
     const now = Date.now();
     if (pointerInBox()) lastInside = Math.max(lastInside, now);
-    const show = busy || saving || now < peekUntil || now - lastInside < 800 || !!box.querySelector(':focus-visible');
+    const show = busy || saving || picker.loading || now < peekUntil || now - lastInside < 800 || !!box.querySelector(':focus-visible');
     const want = show ? 'shown' : 'hidden';
     if (box.dataset.state === want) return;
     box.dataset.state = want;
@@ -452,9 +481,10 @@
     return document.title.replace(/^\(\d+\)\s*/, '').replace(/\s*-\s*YouTube\s*$/, '');
   }
 
-  // 재생목록 페이지면 목록 ID. 나중에 볼 동영상·좋아요·믹스는 로그인/무한 목록이라 제외.
+  // 재생목록 페이지나 재생목록으로 재생 중인 화면이면 목록 ID.
+  // 나중에 볼 동영상·좋아요·믹스는 로그인/무한 목록이라 제외.
   function playlistOnPage() {
-    if (location.pathname !== '/playlist') return null;
+    if (location.pathname !== '/playlist' && location.pathname !== '/watch') return null;
     const id = new URLSearchParams(location.search).get('list');
     if (!id || /^(WL|LL|LM)$/.test(id) || id.startsWith('RD')) return null;
     return id;
@@ -545,7 +575,7 @@
         channelId: src.channelId || null,
         listId: src.listId || null,
         reverse: !!src.reverse,
-        channelName: src.name,
+        channelName: src.name || items.title || '재생목록',
         index,
       });
       rememberProgress(s);
@@ -558,10 +588,69 @@
     }
   }
 
+  // 채널 페이지의 "재생목록" 고르기
+  let picker = { base: '', open: false, loading: false, error: '', items: null };
+  async function loadPicker(base) {
+    picker = { base, open: true, loading: true, error: '', items: null };
+    render();
+    try {
+      const post = makePost();
+      const items = await fetchChannelPlaylists(post, await resolveChannelId(post, base));
+      if (picker.base === base) Object.assign(picker, { loading: false, items });
+    } catch (e) {
+      if (picker.base === base) Object.assign(picker, { loading: false, error: (e && e.message) || String(e) });
+    }
+    render();
+  }
+  function togglePicker(base) {
+    if (picker.base === base && (picker.items || picker.loading)) {
+      picker.open = !picker.open;
+      render();
+      return;
+    }
+    loadPicker(base);
+  }
+
+  function buildPicker(s) {
+    const wrap = el('div', STYLE.list);
+    wrap.setAttribute('data-picker', '');
+    if (picker.loading) { wrap.appendChild(el('div', STYLE.note, '재생목록 불러오는 중…')); return wrap; }
+    if (picker.error) {
+      wrap.appendChild(el('div', STYLE.note, '재생목록을 불러오지 못했습니다: ' + picker.error));
+      wrap.appendChild(el('button', STYLE.sub, '다시 시도', () => loadPicker(picker.base)));
+      return wrap;
+    }
+    if (!picker.items.length) { wrap.appendChild(el('div', STYLE.note, '이 채널에는 공개 재생목록이 없습니다')); return wrap; }
+    wrap.appendChild(el('div', STYLE.head, '채널 재생목록 ' + picker.items.length + '개'));
+    for (const p of picker.items) {
+      const key = 'pl:' + p.id;
+      const prev = s.progress && s.progress[key];
+      const row = el('div', STYLE.pickRow);
+      const body = el('span', STYLE.body);
+      body.appendChild(el('span', STYLE.title, p.title || p.id));
+      const status = el('span', STYLE.meta, [p.count,
+        prev ? (prev.index + 1) + '/' + prev.total + (prev.reverse ? ' 거꾸로' : '') + ' 보는 중' : ''].filter(Boolean).join(' · '));
+      body.appendChild(status);
+      row.appendChild(body);
+      // 보던 방향이면 이어서, 아니면 처음부터
+      const begin = (reverse) => start({ key, listId: p.id, reverse, name: p.title },
+        !(prev && !!prev.reverse === reverse), status);
+      const fwd = el('button', STYLE.small, '정주행', () => begin(false));
+      fwd.title = '재생목록 순서대로' + (prev && !prev.reverse ? ' (보던 곳부터)' : '');
+      const rev = el('button', STYLE.small, '거꾸로', () => begin(true));
+      rev.title = '재생목록 반대 순서로' + (prev && prev.reverse ? ' (보던 곳부터)' : '');
+      row.appendChild(fwd);
+      row.appendChild(rev);
+      wrap.appendChild(row);
+    }
+    return wrap;
+  }
+
   function renderChannel(base) {
     const s = load();
     const prev = s.progress && s.progress[baseKey(base)];
-    const sig = 'ch|' + base + '|' + (prev ? prev.index + '/' + prev.total : '');
+    const pk = picker.base === base ? [picker.open, picker.loading, picker.error, picker.items ? picker.items.length : ''].join(':') : '';
+    const sig = 'ch|' + base + '|' + (prev ? prev.index + '/' + prev.total : '') + '|' + pk;
     setBox(sig, (b) => {
       const row = el('div', STYLE.row);
       const src = () => ({ key: baseKey(base), base, name: pageName() });
@@ -570,7 +659,10 @@
       main.addEventListener('click', () => start(src(), false, main));
       row.appendChild(main);
       if (prev) row.appendChild(el('button', STYLE.sub, '처음부터', () => start(src(), true, main)));
+      const open = picker.base === base && picker.open;
+      row.appendChild(el('button', open ? STYLE.subOn : STYLE.sub, '재생목록', () => togglePicker(base)));
       b.appendChild(row);
+      if (open) b.appendChild(buildPicker(s));
     }, 'ch|' + base);
   }
 
@@ -581,7 +673,8 @@
     const sig = 'pl|' + listId + '|' + (prev ? prev.index + '/' + prev.total + '/' + !!prev.reverse : '');
     setBox(sig, (b) => {
       const row = el('div', STYLE.row);
-      const src = (reverse) => ({ key, listId, reverse, name: pageName() });
+      const name = location.pathname === '/playlist' ? pageName() : '';
+      const src = (reverse) => ({ key, listId, reverse, name });
       if (prev) {
         const main = el('button', STYLE.btn,
           '▶ 이어보기 (' + (prev.index + 1) + '/' + prev.total + (prev.reverse ? ', 거꾸로' : '') + ')');
@@ -591,7 +684,7 @@
         row.appendChild(el('button', STYLE.sub, prev.reverse ? '▶ 순서대로 처음부터' : '⇅ 거꾸로 처음부터',
           () => start(src(!prev.reverse), true, main)));
       } else {
-        const main = el('button', STYLE.btn, '▶ 정주행');
+        const main = el('button', STYLE.btn, '▶ 재생목록 정주행');
         main.addEventListener('click', () => start(src(false), true, main));
         row.appendChild(main);
         row.appendChild(el('button', STYLE.sub, '⇅ 거꾸로 정주행', () => start(src(true), true, main)));
