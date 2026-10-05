@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 오래된 순 정주행
 // @namespace    youtube-oldest-first-binge
-// @version      1.6.0
+// @version      1.7.0
 // @description  채널 동영상을 가장 오래된 영상부터, 재생목록은 정해진 순서(또는 거꾸로)로 이어서 재생합니다.
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -380,9 +380,9 @@
     box: 'position:fixed;top:64px;right:12px;z-index:2147483000;display:flex;flex-direction:column;' +
       'align-items:flex-end;max-width:calc(100vw - 24px);font:500 13px/1.3 Roboto,Arial,sans-serif',
     // 숨었을 때 보이는 손잡이: 밝은 화면과 어두운 화면 모두에서 보이도록 테두리를 둔다.
-    tab: 'all:unset;cursor:pointer;display:inline-flex;align-items:center;padding:6px 12px;border-radius:999px;' +
-      'background:rgba(15,15,15,.88);color:#fff;font:600 12px/1.2 Roboto,Arial,sans-serif;' +
-      'border:1px solid rgba(255,255,255,.35);box-shadow:0 2px 8px rgba(0,0,0,.35);white-space:nowrap',
+    tab: 'all:unset;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;' +
+      'width:36px;height:36px;border-radius:50%;background:rgba(60,64,67,.92);color:#fff;' +
+      'font:14px/1 Roboto,Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.35)',
     panel: 'display:flex;flex-direction:column;gap:8px;min-width:0;max-width:100%;box-sizing:border-box;' +
       'background:rgba(15,15,15,.94);color:#fff;padding:8px 10px;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.35)',
     row: 'display:flex;flex-wrap:wrap;gap:6px;align-items:center',
@@ -414,11 +414,10 @@
 
   let box = null;
   let boxSig = '';
-  let peekKey = '';
   // 내용이 바뀌었을 때만 다시 그린다. 새로 그렸으면 true.
-  // 평소에는 작은 손잡이(tab)만 보이고, 마우스를 올리거나 누르면 패널이 펼쳐진다.
-  // key가 바뀌면(새 영상, 다른 채널) 잠깐 펼쳐 보여 준다.
-  function setBox(sig, build, key, tabText) {
+  // 평소에는 아무것도 안 보이고, 마우스가 오른쪽 위 영역에 들어오면 동그란 버튼(tab)이,
+  // 그 버튼에 마우스를 올리거나 누르면 패널이 보인다. tabText는 버튼 툴팁.
+  function setBox(sig, build, tabText) {
     if (box && boxSig === sig && document.body.contains(box)) return false;
     if (box) box.remove();
     box = null;
@@ -426,12 +425,13 @@
     if (!build) return false;
     box = el('div', STYLE.box);
     box.id = 'oldest-first-binge';
-    const tab = el('button', STYLE.tab, tabText || '▶ 정주행', () => {
+    const tab = el('button', STYLE.tab, '▶', () => {
       lastInside = Date.now() + 1500;
       updateVisibility();
     });
     tab.setAttribute('data-tab', '');
-    tab.title = '오래된 순 정주행';
+    tab.title = tabText || '오래된 순 정주행';
+    tab.setAttribute('aria-label', tab.title);
     const panel = el('div', STYLE.panel);
     panel.setAttribute('data-panel', '');
     build(panel);
@@ -439,10 +439,6 @@
     box.appendChild(panel);
     box.addEventListener('pointerdown', () => { lastInside = Date.now() + 1500; });
     document.body.appendChild(box);
-    if (key && key !== peekKey) {
-      peekKey = key;
-      peekUntil = Date.now() + 3000;
-    }
     updateVisibility();
     return true;
   }
@@ -452,7 +448,16 @@
   let mouseX = -1;
   let mouseY = -1;
   let lastInside = 0;
-  let peekUntil = 0;
+  let lastZone = 0;
+  const ZONE_W = 200; // 오른쪽 끝에서 이만큼
+  const ZONE_TOP = 56; // YouTube 상단 바 아래부터
+  const ZONE_H = 110;
+
+  // 버튼이 나타나는 영역. 요소를 깔지 않고 마우스 좌표로만 판단해서 아래 클릭을 막지 않는다.
+  function pointerInZone() {
+    if (mouseX < 0) return false;
+    return mouseX >= window.innerWidth - ZONE_W && mouseY >= ZONE_TOP && mouseY <= ZONE_TOP + ZONE_H;
+  }
 
   function pointerInBox() {
     if (!box || mouseX < 0) return false;
@@ -464,12 +469,13 @@
     if (!box) return;
     const now = Date.now();
     if (pointerInBox()) lastInside = Math.max(lastInside, now);
-    const show = busy || saving || picker.loading || now < peekUntil || now - lastInside < 800 || !!box.querySelector(':focus-visible');
-    const want = show ? 'shown' : 'hidden';
+    if (pointerInZone()) lastZone = now;
+    const show = busy || saving || picker.loading || now - lastInside < 800 || !!box.querySelector(':focus-visible');
+    const want = show ? 'shown' : now - lastZone < 800 ? 'tab' : 'hidden';
     if (box.dataset.state === want) return;
     box.dataset.state = want;
-    box.querySelector('[data-tab]').style.display = show ? 'none' : 'inline-flex';
-    box.querySelector('[data-panel]').style.display = show ? 'flex' : 'none';
+    box.querySelector('[data-tab]').style.display = want === 'tab' ? 'inline-flex' : 'none';
+    box.querySelector('[data-panel]').style.display = want === 'shown' ? 'flex' : 'none';
   }
 
   let moveQueued = false;
@@ -671,7 +677,7 @@
       row.appendChild(el('button', open ? STYLE.subOn : STYLE.sub, '재생목록', () => togglePicker(base)));
       b.appendChild(row);
       if (open) b.appendChild(buildPicker(s));
-    }, 'ch|' + base, prev ? '▶ 이어보기' : '▶ 정주행');
+    }, prev ? '이어보기 (' + (prev.index + 1) + '/' + prev.total + ')' : '오래된 순 정주행');
   }
 
   function renderPlaylist(listId) {
@@ -698,7 +704,7 @@
         row.appendChild(el('button', STYLE.sub, '⇅ 거꾸로 정주행', () => start(src(true), true, main)));
       }
       b.appendChild(row);
-    }, 'pl|' + listId, '▶ 재생목록 정주행');
+    }, '재생목록 정주행');
   }
 
   function buildList(s) {
@@ -774,7 +780,7 @@
       }));
       b.appendChild(row);
       if (open) b.appendChild(buildList(s));
-    }, 'w|' + s.index, '▶ ' + (s.index + 1) + '/' + s.ids.length);
+    }, '정주행 ' + (s.index + 1) + '/' + s.ids.length);
     if (rebuilt && open) {
       // 지금 보는 영상이 목록 가운데 오도록
       const list = box.querySelector('[data-list]');
@@ -822,7 +828,7 @@
         render();
       }));
       b.appendChild(row);
-    }, null, '▶ 이어보기');
+    }, '이어보기: ' + (s.channelName || ''));
   }
 
   function render() {
