@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube 오래된 순 정주행
 // @namespace    youtube-oldest-first-binge
-// @version      1.2.0
-// @description  채널 동영상을 가장 오래된 영상부터 순서대로 이어서 재생합니다.
+// @version      1.3.0
+// @description  채널 동영상을 가장 오래된 영상부터, 재생목록은 정해진 순서(또는 거꾸로)로 이어서 재생합니다.
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
 // @grant        none
@@ -125,7 +125,17 @@
     throw new Error('채널 ID를 찾지 못했습니다');
   }
 
-  const Core = { parsePage, fetchPlaylist, fetchOldestFirst, resolveChannelId };
+  // 정주행 대상: 채널({ channelId | base }) 또는 재생목록({ listId, reverse })
+  async function fetchSource(post, src, onProgress) {
+    if (src.listId) {
+      const items = await fetchPlaylist(post, src.listId, onProgress);
+      return src.reverse ? items.reverse() : items;
+    }
+    const channelId = src.channelId || await resolveChannelId(post, src.base);
+    return fetchOldestFirst(post, channelId, onProgress);
+  }
+
+  const Core = { parsePage, fetchPlaylist, fetchOldestFirst, resolveChannelId, fetchSource };
   if (typeof module === 'object' && module.exports) { module.exports = Core; return; }
 
   // ───────── 여기부터 YouTube 페이지 동작 ─────────
@@ -203,7 +213,7 @@
 
   function rememberProgress(s) {
     s.progress = s.progress || {};
-    s.progress[s.key] = { videoId: s.ids[s.index], index: s.index, total: s.ids.length };
+    s.progress[s.key] = { videoId: s.ids[s.index], index: s.index, total: s.ids.length, reverse: !!s.reverse };
   }
 
   let movingFrom = null;
@@ -247,13 +257,13 @@
     metaLoading = true;
     try {
       const s0 = load();
-      const post = makePost();
-      const channelId = s0.channelId || await resolveChannelId(post, s0.base || encodeURI(s0.key || ''));
-      const items = await fetchOldestFirst(post, channelId);
+      const src = s0.listId
+        ? { listId: s0.listId, reverse: s0.reverse }
+        : { channelId: s0.channelId, base: s0.base || encodeURI(s0.key || '') };
+      const items = await fetchSource(makePost(), src);
       const s = load();
       s.meta = {};
       for (const v of items) s.meta[v.id] = [v.title, v.len, v.age];
-      s.channelId = channelId;
       save(s);
     } catch (e) {
       metaError = (e && e.message) || String(e);
@@ -367,21 +377,35 @@
     if (!e.relatedTarget) { mouseX = -1; mouseY = -1; } // 창 밖으로 나감
   });
 
+  function pageName() {
+    return document.title.replace(/^\(\d+\)\s*/, '').replace(/\s*-\s*YouTube\s*$/, '');
+  }
+
+  // 재생목록 페이지면 목록 ID. 나중에 볼 동영상·좋아요·믹스는 로그인/무한 목록이라 제외.
+  function playlistOnPage() {
+    if (location.pathname !== '/playlist') return null;
+    const id = new URLSearchParams(location.search).get('list');
+    if (!id || /^(WL|LL|LM)$/.test(id) || id.startsWith('RD')) return null;
+    return id;
+  }
+
   let busy = false;
-  async function start(base, fromStart, label) {
+  // src: { key, name } + 채널({ base }) 또는 재생목록({ listId, reverse })
+  async function start(src, fromStart, label) {
     if (busy) return;
     busy = true;
     const show = (t) => { label.textContent = t; };
     try {
-      show('채널 확인 중…');
+      show(src.listId ? '재생목록 확인 중…' : '채널 확인 중…');
       const post = makePost();
-      const channelId = await resolveChannelId(post, base);
-      const items = await fetchOldestFirst(post, channelId, (n) => show('목록 불러오는 중… ' + n + '개'));
-      if (items.length === 0) throw new Error('재생할 영상이 없습니다');
+      if (!src.listId) src.channelId = await resolveChannelId(post, src.base);
+      const items = await fetchSource(post, src, (n) => show('목록 불러오는 중… ' + n + '개'));
+      if (items.length === 0) {
+        throw new Error(src.listId ? '재생할 영상이 없습니다 (비공개 재생목록은 지원하지 않습니다)' : '재생할 영상이 없습니다');
+      }
       const s = load();
-      const key = baseKey(base);
       applyItems(s, items);
-      const prev = s.progress && s.progress[key];
+      const prev = s.progress && s.progress[src.key];
       let index = 0;
       if (!fromStart && prev) {
         index = s.ids.indexOf(prev.videoId);
@@ -389,10 +413,12 @@
       }
       Object.assign(s, {
         active: true,
-        key,
-        base,
-        channelId,
-        channelName: document.title.replace(/^\(\d+\)\s*/, '').replace(/\s*-\s*YouTube\s*$/, ''),
+        key: src.key,
+        base: src.base || null,
+        channelId: src.channelId || null,
+        listId: src.listId || null,
+        reverse: !!src.reverse,
+        channelName: src.name,
         index,
       });
       rememberProgress(s);
@@ -411,13 +437,40 @@
     const sig = 'ch|' + base + '|' + (prev ? prev.index + '/' + prev.total : '');
     setBox(sig, (b) => {
       const row = el('div', STYLE.row);
+      const src = () => ({ key: baseKey(base), base, name: pageName() });
       const main = el('button', STYLE.btn,
         prev ? '▶ 이어보기 (' + (prev.index + 1) + '/' + prev.total + ')' : '▶ 오래된 순 정주행');
-      main.addEventListener('click', () => start(base, false, main));
+      main.addEventListener('click', () => start(src(), false, main));
       row.appendChild(main);
-      if (prev) row.appendChild(el('button', STYLE.sub, '처음부터', () => start(base, true, main)));
+      if (prev) row.appendChild(el('button', STYLE.sub, '처음부터', () => start(src(), true, main)));
       b.appendChild(row);
     }, 'ch|' + base);
+  }
+
+  function renderPlaylist(listId) {
+    const s = load();
+    const key = 'pl:' + listId;
+    const prev = s.progress && s.progress[key];
+    const sig = 'pl|' + listId + '|' + (prev ? prev.index + '/' + prev.total + '/' + !!prev.reverse : '');
+    setBox(sig, (b) => {
+      const row = el('div', STYLE.row);
+      const src = (reverse) => ({ key, listId, reverse, name: pageName() });
+      if (prev) {
+        const main = el('button', STYLE.btn,
+          '▶ 이어보기 (' + (prev.index + 1) + '/' + prev.total + (prev.reverse ? ', 거꾸로' : '') + ')');
+        main.addEventListener('click', () => start(src(!!prev.reverse), false, main));
+        row.appendChild(main);
+        row.appendChild(el('button', STYLE.sub, '처음부터', () => start(src(!!prev.reverse), true, main)));
+        row.appendChild(el('button', STYLE.sub, prev.reverse ? '▶ 순서대로 처음부터' : '⇅ 거꾸로 처음부터',
+          () => start(src(!prev.reverse), true, main)));
+      } else {
+        const main = el('button', STYLE.btn, '▶ 정주행');
+        main.addEventListener('click', () => start(src(false), true, main));
+        row.appendChild(main);
+        row.appendChild(el('button', STYLE.sub, '⇅ 거꾸로 정주행', () => start(src(true), true, main)));
+      }
+      b.appendChild(row);
+    }, 'pl|' + listId);
   }
 
   function buildList(s) {
@@ -431,7 +484,8 @@
       return list;
     }
     list.appendChild(el('div', STYLE.head,
-      '오래된 순 · 전체 ' + s.ids.length + '개 · 본 영상 ' + s.index + '개'));
+      (s.listId ? (s.reverse ? '재생목록 거꾸로' : '재생목록 순서') : '오래된 순') +
+      ' · 전체 ' + s.ids.length + '개 · 본 영상 ' + s.index + '개'));
     s.ids.forEach((id, i) => {
       const m = s.meta[id] || ['(제목 정보 없음)', '', ''];
       const cur = i === s.index;
@@ -455,8 +509,11 @@
     const sig = ['w', s.index, s.ids.length, open, !!s.meta, metaLoading, metaError].join('|');
     const rebuilt = setBox(sig, (b) => {
       const row = el('div', STYLE.row);
-      row.appendChild(el('span', 'opacity:.85;padding:0 4px',
-        '정주행 ' + (s.channelName || '') + '  ' + (s.index + 1) + ' / ' + s.ids.length));
+      const label = el('span', 'opacity:.85;padding:0 4px;max-width:260px;overflow:hidden;' +
+        'text-overflow:ellipsis;white-space:nowrap',
+        '정주행 ' + (s.channelName || '') + '  ' + (s.index + 1) + ' / ' + s.ids.length);
+      label.title = s.channelName || '';
+      row.appendChild(label);
       row.appendChild(el('button', STYLE.sub, '◀ 이전', () => step(-1)));
       row.appendChild(el('button', STYLE.sub, '다음 ▶', () => step(1)));
       row.appendChild(el('button', open ? STYLE.subOn : STYLE.sub, '목록', () => {
@@ -502,6 +559,8 @@
     if (!document.body) return;
     const s = syncWatch();
     if (s) { renderWatch(s); return; }
+    const listId = playlistOnPage();
+    if (listId) { renderPlaylist(listId); return; }
     const base = channelBase(location.pathname);
     if (base) { renderChannel(base); return; }
     setBox('', null);
