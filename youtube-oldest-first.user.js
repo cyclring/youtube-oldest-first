@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 오래된 순 정주행
 // @namespace    youtube-oldest-first-binge
-// @version      1.1.1
+// @version      1.2.0
 // @description  채널 동영상을 가장 오래된 영상부터 순서대로 이어서 재생합니다.
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -269,9 +269,12 @@
     'width:100%;padding:6px 8px;border-radius:8px;';
   const SUB = 'all:unset;cursor:pointer;padding:6px 8px;border-radius:8px;';
   const STYLE = {
-    box: 'position:fixed;right:20px;bottom:20px;z-index:2147483000;display:flex;flex-direction:column;gap:8px;' +
-      'max-width:calc(100vw - 40px);background:rgba(15,15,15,.94);color:#fff;padding:8px 10px;border-radius:12px;' +
-      'font:500 13px/1.3 Roboto,Arial,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.35)',
+    // 화면 오른쪽 위(YouTube 상단 바 바로 아래)에 붙는다.
+    box: 'position:fixed;top:64px;right:0;z-index:2147483000;display:flex;align-items:stretch;gap:6px;' +
+      'max-width:calc(100vw - 24px);background:rgba(15,15,15,.94);color:#fff;padding:8px 10px 8px 6px;' +
+      'border-radius:12px 0 0 12px;font:500 13px/1.3 Roboto,Arial,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.35)',
+    grip: 'flex:0 0 4px;margin:4px 0;border-radius:2px;background:rgba(255,255,255,.45)',
+    inner: 'display:flex;flex-direction:column;gap:8px;min-width:0',
     row: 'display:flex;flex-wrap:wrap;gap:6px;align-items:center',
     btn: 'all:unset;cursor:pointer;padding:6px 10px;border-radius:8px;background:#3ea6ff;color:#0f0f0f;font-weight:700',
     sub: SUB + 'background:rgba(255,255,255,.14);color:#fff',
@@ -298,8 +301,10 @@
 
   let box = null;
   let boxSig = '';
+  let peekKey = '';
   // 내용이 바뀌었을 때만 다시 그린다. 새로 그렸으면 true.
-  function setBox(sig, build) {
+  // key가 바뀌면(새 영상, 다른 채널) 잠깐 보여 줬다가 숨긴다.
+  function setBox(sig, build, key) {
     if (box && boxSig === sig && document.body.contains(box)) return false;
     if (box) box.remove();
     box = null;
@@ -307,10 +312,60 @@
     if (!build) return false;
     box = el('div', STYLE.box);
     box.id = 'oldest-first-binge';
-    build(box);
+    if (!REDUCED_MOTION) box.style.transition = 'transform .18s ease, opacity .18s ease';
+    box.appendChild(el('div', STYLE.grip));
+    const inner = el('div', STYLE.inner);
+    build(inner);
+    box.appendChild(inner);
+    box.addEventListener('pointerdown', () => { lastInside = Date.now() + 1500; });
     document.body.appendChild(box);
+    if (key && key !== peekKey) {
+      peekKey = key;
+      peekUntil = Date.now() + 3000;
+    }
+    updateVisibility();
     return true;
   }
+
+  // ───────── 자동 숨김 ─────────
+  // 숨었을 때는 오른쪽 끝에 손잡이(14px)만 남고, 마우스를 올리면 펼쳐진다.
+
+  const REDUCED_MOTION = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const HIDDEN = 'translateX(calc(100% - 14px))';
+  let mouseX = -1;
+  let mouseY = -1;
+  let lastInside = 0;
+  let peekUntil = 0;
+
+  function pointerInBox() {
+    if (!box || mouseX < 0) return false;
+    const r = box.getBoundingClientRect();
+    return mouseX >= r.left && mouseX <= r.right && mouseY >= r.top && mouseY <= r.bottom;
+  }
+
+  function updateVisibility() {
+    if (!box) return;
+    const now = Date.now();
+    if (pointerInBox()) lastInside = Math.max(lastInside, now);
+    const show = busy || now < peekUntil || now - lastInside < 800 || !!box.querySelector(':focus-visible');
+    const want = show ? 'shown' : 'hidden';
+    if (box.dataset.state === want) return;
+    box.dataset.state = want;
+    box.style.transform = show ? 'none' : HIDDEN;
+    box.style.opacity = show ? '1' : '0.6';
+  }
+
+  let moveQueued = false;
+  document.addEventListener('mousemove', (e) => {
+    mouseX = e.clientX;
+    mouseY = e.clientY;
+    if (moveQueued) return;
+    moveQueued = true;
+    requestAnimationFrame(() => { moveQueued = false; updateVisibility(); });
+  }, { passive: true });
+  document.addEventListener('mouseout', (e) => {
+    if (!e.relatedTarget) { mouseX = -1; mouseY = -1; } // 창 밖으로 나감
+  });
 
   let busy = false;
   async function start(base, fromStart, label) {
@@ -362,7 +417,7 @@
       row.appendChild(main);
       if (prev) row.appendChild(el('button', STYLE.sub, '처음부터', () => start(base, true, main)));
       b.appendChild(row);
-    });
+    }, 'ch|' + base);
   }
 
   function buildList(s) {
@@ -399,7 +454,6 @@
     const open = !!s.listOpen;
     const sig = ['w', s.index, s.ids.length, open, !!s.meta, metaLoading, metaError].join('|');
     const rebuilt = setBox(sig, (b) => {
-      if (open) b.appendChild(buildList(s));
       const row = el('div', STYLE.row);
       row.appendChild(el('span', 'opacity:.85;padding:0 4px',
         '정주행 ' + (s.channelName || '') + '  ' + (s.index + 1) + ' / ' + s.ids.length));
@@ -418,7 +472,8 @@
         render();
       }));
       b.appendChild(row);
-    });
+      if (open) b.appendChild(buildList(s));
+    }, 'w|' + s.index);
     if (rebuilt && open) {
       // 지금 보는 영상이 목록 가운데 오도록
       const list = box.querySelector('[data-list]');
@@ -474,6 +529,7 @@
     const vid = currentVideoId();
     if (movingFrom && vid !== movingFrom) movingFrom = null;
     render();
+    updateVisibility();
     if (!syncWatch()) { errorSince = 0; return; }
     const p = document.getElementById('movie_player');
     if (!p) return;
