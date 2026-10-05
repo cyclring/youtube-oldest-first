@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 오래된 순 정주행
 // @namespace    youtube-oldest-first-binge
-// @version      1.3.0
+// @version      1.4.0
 // @description  채널 동영상을 가장 오래된 영상부터, 재생목록은 정해진 순서(또는 거꾸로)로 이어서 재생합니다.
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -135,12 +135,65 @@
     return fetchOldestFirst(post, channelId, onProgress);
   }
 
-  const Core = { parsePage, fetchPlaylist, fetchOldestFirst, resolveChannelId, fetchSource };
+  // 내 계정에 비공개 재생목록을 만들고 ids 순서대로 담는다. 추가가 안 되는 영상은 건너뛴다.
+  async function savePlaylist(post, title, ids, onProgress, wait) {
+    const pause = wait || ((ms) => new Promise((r) => setTimeout(r, ms)));
+    const CHUNK = 50;
+    let added = 0;
+    const skipped = [];
+    const report = () => { if (onProgress) onProgress(added + skipped.length); };
+    const created = await post('playlist/create', { title, privacyStatus: 'PRIVATE', videoIds: ids.slice(0, 1) });
+    const playlistId = created && created.playlistId;
+    if (!playlistId) throw new Error('재생목록을 만들지 못했습니다');
+    added = 1;
+    report();
+    async function add(chunk) {
+      try {
+        await pause(250);
+        const r = await post('browse/edit_playlist', {
+          playlistId,
+          actions: chunk.map((id) => ({ action: 'ACTION_ADD_VIDEO', addedVideoId: id })),
+        });
+        if (r && r.status && r.status !== 'STATUS_SUCCEEDED') throw new Error(r.status);
+        added += chunk.length;
+        report();
+      } catch (e) {
+        if (e && e.fatal) throw e; // 로그인 문제는 나눠서 다시 해도 소용없다
+        if (chunk.length === 1) { skipped.push(chunk[0]); report(); return; }
+        const size = chunk.length > 10 ? 10 : 1; // 한 번에 많이 넣는 게 거절되면 잘게 나눠 다시
+        for (let i = 0; i < chunk.length; i += size) await add(chunk.slice(i, i + size));
+      }
+    }
+    for (let i = 1; i < ids.length; i += CHUNK) await add(ids.slice(i, i + CHUNK));
+    return { playlistId, added, skipped };
+  }
+
+  const Core = { parsePage, fetchPlaylist, fetchOldestFirst, resolveChannelId, fetchSource, savePlaylist };
   if (typeof module === 'object' && module.exports) { module.exports = Core; return; }
 
   // ───────── 여기부터 YouTube 페이지 동작 ─────────
 
-  function makePost() {
+  function readCookie(name) {
+    const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  function fatal(message) {
+    return Object.assign(new Error(message), { fatal: true });
+  }
+
+  // YouTube 사이트가 로그인 요청에 붙이는 것과 같은 서명
+  async function authHeader() {
+    const sid = readCookie('SAPISID') || readCookie('__Secure-3PAPISID') || readCookie('__Secure-1PAPISID');
+    if (!sid) throw fatal('YouTube에 로그인돼 있어야 저장할 수 있습니다');
+    const ts = Math.floor(Date.now() / 1000);
+    const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(ts + ' ' + sid + ' ' + location.origin));
+    const hex = Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+    return 'SAPISIDHASH ' + ts + '_' + hex;
+  }
+
+  // signedIn이면 내 계정으로(재생목록 저장용), 아니면 로그아웃 상태로 요청한다.
+  function makePost(signedIn) {
     const cfg = window.ytcfg && typeof window.ytcfg.get === 'function' ? window.ytcfg : null;
     const get = (k, d) => (cfg && cfg.get(k)) || d;
     const context = {
@@ -152,12 +205,28 @@
       },
     };
     return async (endpoint, body) => {
-      const r = await fetch('/youtubei/v1/' + endpoint + '?prettyPrint=false', {
+      const headers = { 'Content-Type': 'application/json' };
+      let query = '?prettyPrint=false';
+      if (signedIn) {
+        headers.Authorization = await authHeader();
+        headers['X-Origin'] = location.origin;
+        headers['X-Goog-AuthUser'] = String(get('SESSION_INDEX', '0'));
+        headers['X-Youtube-Client-Name'] = '1';
+        headers['X-Youtube-Client-Version'] = context.client.clientVersion;
+        const pageId = get('DELEGATED_SESSION_ID', '');
+        if (pageId) headers['X-Goog-PageId'] = pageId;
+        const key = get('INNERTUBE_API_KEY', '');
+        if (key) query += '&key=' + encodeURIComponent(key);
+      }
+      const r = await fetch('/youtubei/v1/' + endpoint + query, {
         method: 'POST',
-        credentials: 'omit',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: signedIn ? 'include' : 'omit',
+        headers,
         body: JSON.stringify(Object.assign({ context }, body)),
       });
+      if (signedIn && (r.status === 401 || r.status === 403)) {
+        throw fatal('YouTube 로그인 확인에 실패했습니다 (' + r.status + ')');
+      }
       if (!r.ok) throw new Error('YouTube 응답 오류 ' + r.status);
       return r.json();
     };
@@ -291,7 +360,9 @@
     subOn: SUB + 'background:#3ea6ff;color:#0f0f0f;font-weight:700',
     list: 'position:relative;width:400px;max-width:100%;max-height:min(60vh,520px);overflow-y:auto;' +
       'display:flex;flex-direction:column;gap:2px',
-    head: 'padding:2px 8px 6px;color:#aaa;font-size:12px',
+    head: 'display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;padding:2px 8px 6px;color:#aaa;font-size:12px',
+    small: SUB + 'padding:4px 8px;font-size:12px;background:rgba(255,255,255,.14);color:#fff',
+    link: 'color:#3ea6ff;text-decoration:none;font-size:12px',
     item: ITEM,
     itemCur: ITEM + 'background:rgba(62,166,255,.24)',
     num: 'flex:0 0 32px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums',
@@ -357,7 +428,7 @@
     if (!box) return;
     const now = Date.now();
     if (pointerInBox()) lastInside = Math.max(lastInside, now);
-    const show = busy || now < peekUntil || now - lastInside < 800 || !!box.querySelector(':focus-visible');
+    const show = busy || saving || now < peekUntil || now - lastInside < 800 || !!box.querySelector(':focus-visible');
     const want = show ? 'shown' : 'hidden';
     if (box.dataset.state === want) return;
     box.dataset.state = want;
@@ -387,6 +458,62 @@
     const id = new URLSearchParams(location.search).get('list');
     if (!id || /^(WL|LL|LM)$/.test(id) || id.startsWith('RD')) return null;
     return id;
+  }
+
+  // ───────── 내 재생목록으로 저장 ─────────
+
+  let saving = false;
+  let saveText = '';
+  let saveFor = '';
+  function setSaveText(key, t) {
+    saveFor = key;
+    saveText = t;
+    const e = box && box.querySelector('[data-save]');
+    if (e) e.textContent = t;
+  }
+
+  function savedTitle(s) {
+    const name = (s.channelName || '정주행').slice(0, 120);
+    return s.listId ? name + (s.reverse ? ' (거꾸로)' : ' (순서대로)') : name + ' - 오래된 순';
+  }
+
+  async function saveQueue() {
+    if (saving) return;
+    const s = load();
+    if (!s.ids || !s.ids.length) return;
+    if (s.saved && s.saved[s.key] &&
+        !confirm('이 목록은 이미 내 재생목록으로 저장했습니다.\n새 재생목록을 하나 더 만들까요?')) return;
+    const key = s.key;
+    const ids = s.ids.slice(0, 5000); // YouTube 재생목록 최대 개수
+    const title = savedTitle(s);
+    saving = true;
+    try {
+      const post = makePost(true);
+      setSaveText(key, '저장 중… 0/' + ids.length);
+      const res = await savePlaylist(post, title, ids, (n) => setSaveText(key, '저장 중… ' + n + '/' + ids.length));
+      const cur = load();
+      cur.saved = cur.saved || {};
+      cur.saved[key] = { playlistId: res.playlistId, count: res.added, title };
+      save(cur);
+      setSaveText(key, '순서 확인 중…');
+      await new Promise((r) => setTimeout(r, 1500));
+      let check;
+      try {
+        const back = (await fetchPlaylist(post, res.playlistId)).map((v) => v.id);
+        const want = ids.filter((id) => !res.skipped.includes(id));
+        check = back.join() === want.join() ? '순서 확인됨' : '순서가 다르게 보입니다. YouTube에서 확인해 주세요';
+      } catch (e) {
+        check = '순서는 확인하지 못했습니다';
+      }
+      setSaveText(key, '저장 완료 ' + res.added + '개' +
+        (res.skipped.length ? ' (' + res.skipped.length + '개 건너뜀)' : '') + ' · ' + check +
+        (s.ids.length > ids.length ? ' · 최대 5000개까지만 저장' : ''));
+    } catch (e) {
+      setSaveText(key, '저장 실패: ' + ((e && e.message) || e));
+    } finally {
+      saving = false;
+      render();
+    }
   }
 
   let busy = false;
@@ -483,9 +610,24 @@
       }
       return list;
     }
-    list.appendChild(el('div', STYLE.head,
+    const head = el('div', STYLE.head);
+    head.appendChild(el('span', '',
       (s.listId ? (s.reverse ? '재생목록 거꾸로' : '재생목록 순서') : '오래된 순') +
       ' · 전체 ' + s.ids.length + '개 · 본 영상 ' + s.index + '개'));
+    const saveBtn = el('button', STYLE.small,
+      (saveFor === s.key && saveText) || '재생목록으로 저장', saveQueue);
+    saveBtn.setAttribute('data-save', '');
+    saveBtn.title = '이 순서 그대로 내 YouTube 재생목록(비공개)으로 저장합니다';
+    head.appendChild(saveBtn);
+    const saved = s.saved && s.saved[s.key];
+    if (saved) {
+      const a = el('a', STYLE.link, '저장한 재생목록 열기');
+      a.href = '/playlist?list=' + encodeURIComponent(saved.playlistId);
+      a.target = '_blank';
+      a.rel = 'noopener';
+      head.appendChild(a);
+    }
+    list.appendChild(head);
     s.ids.forEach((id, i) => {
       const m = s.meta[id] || ['(제목 정보 없음)', '', ''];
       const cur = i === s.index;
@@ -506,7 +648,8 @@
 
   function renderWatch(s) {
     const open = !!s.listOpen;
-    const sig = ['w', s.index, s.ids.length, open, !!s.meta, metaLoading, metaError].join('|');
+    const savedId = s.saved && s.saved[s.key] ? s.saved[s.key].playlistId : '';
+    const sig = ['w', s.index, s.ids.length, open, !!s.meta, metaLoading, metaError, savedId].join('|');
     const rebuilt = setBox(sig, (b) => {
       const row = el('div', STYLE.row);
       const label = el('span', 'opacity:.85;padding:0 4px;max-width:260px;overflow:hidden;' +
